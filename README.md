@@ -1,8 +1,8 @@
 # GoProxy
 
-A lightweight, feature-rich HTTPS reverse proxy server written in Go, with automatic SSL certificate management and multi-domain support.
-
 <img src="logo.svg" width="100">
+
+A lightweight, feature-rich HTTPS reverse proxy server written in Go, with automatic SSL certificate management and multi-domain support.
 
 ## Features
 
