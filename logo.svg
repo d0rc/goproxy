@@ -1,0 +1,103 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 240 240">
+  <defs>
+    <!-- Gradients -->
+    <linearGradient id="proxy-gradient" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#FF6B6B"/>
+      <stop offset="100%" style="stop-color:#4ECDC4"/>
+    </linearGradient>
+    
+    <!-- Glow Effects -->
+    <filter id="neon-glow">
+      <feGaussianBlur in="SourceGraphic" stdDeviation="2" result="blur"/>
+      <feColorMatrix in="blur" type="matrix" values="
+        1 0 0 0 0
+        0 1 0 0 0
+        0 0 1 0 0
+        0 0 0 12 -3" result="glow"/>
+      <feMerge>
+        <feMergeNode in="glow"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+
+    <!-- Route Path Pattern -->
+    <pattern id="route-pattern" x="0" y="0" width="20" height="20" patternUnits="userSpaceOnUse">
+      <path d="M0 10h20" stroke="#4ECDC4" stroke-width="2" stroke-dasharray="2 3"/>
+    </pattern>
+  </defs>
+
+  <!-- Background Shape -->
+  <path d="M120 40
+           L200 80
+           L200 160
+           L120 200
+           L40 160
+           L40 80 Z" 
+        fill="#1A1B1E" 
+        stroke="url(#proxy-gradient)" 
+        stroke-width="4"/>
+
+  <!-- Central Router Symbol -->
+  <g transform="translate(120 120)" filter="url(#neon-glow)">
+    <!-- Outer Ring -->
+    <circle r="40" fill="none" stroke="#FF6B6B" stroke-width="4"/>
+    
+    <!-- Inner Spokes -->
+    <g stroke="#4ECDC4" stroke-width="4">
+      <line x1="-20" y1="-20" x2="20" y2="20"/>
+      <line x1="20" y1="-20" x2="-20" y2="20"/>
+      <line x1="0" y1="-28" x2="0" y2="28"/>
+      <line x1="-28" y1="0" x2="28" y2="0"/>
+    </g>
+    
+    <!-- Center Point -->
+    <circle r="8" fill="#FF6B6B"/>
+  </g>
+
+  <!-- Route Lines -->
+  <g stroke-width="2" filter="url(#neon-glow)">
+    <!-- Top Routes -->
+    <path d="M120 80
+             Q160 80, 160 120" 
+          stroke="#4ECDC4" 
+          fill="none"/>
+    <path d="M120 80
+             Q80 80, 80 120" 
+          stroke="#FF6B6B" 
+          fill="none"/>
+          
+    <!-- Bottom Routes -->
+    <path d="M120 160
+             Q160 160, 160 120" 
+          stroke="#4ECDC4" 
+          fill="none"/>
+    <path d="M120 160
+             Q80 160, 80 120" 
+          stroke="#FF6B6B" 
+          fill="none"/>
+  </g>
+
+  <!-- Connection Points -->
+  <g fill="#FF6B6B" filter="url(#neon-glow)">
+    <circle cx="120" cy="80" r="6"/>
+    <circle cx="120" cy="160" r="6"/>
+    <circle cx="160" cy="120" r="6"/>
+    <circle cx="80" cy="120" r="6"/>
+  </g>
+
+  <!-- Animated Pulse Effect -->
+  <circle cx="120" cy="120" r="60" 
+          stroke="#4ECDC4" 
+          stroke-width="2"
+          fill="none"
+          opacity="0.3">
+    <animate attributeName="r" 
+             values="60;70;60" 
+             dur="2s" 
+             repeatCount="indefinite"/>
+    <animate attributeName="opacity" 
+             values="0.3;0;0.3" 
+             dur="2s" 
+             repeatCount="indefinite"/>
+  </circle>
+</svg>
