@@ -56,14 +56,18 @@ func main() {
 	for domain, config := range domains {
 		router := mainRouter.Host(domain).Subrouter()
 
-		// Set up static file serving
-		fs := http.FileServer(http.Dir(config.StaticDir))
-		router.PathPrefix("/").Handler(http.StripPrefix("/", fs))
-
-		// Set up proxy routes
+		// Set up proxy routes FIRST
 		for path, targetURL := range config.ProxyURLs {
+			log.Printf("Setting up proxy route for domain %s: %s -> %s", domain, path, targetURL)
 			proxy := createReverseProxy(targetURL)
 			router.PathPrefix(path).Handler(proxy)
+		}
+
+		// Set up static file serving LAST
+		if config.StaticDir != "" {
+			log.Printf("Setting up static file serving for domain %s from directory: %s", domain, config.StaticDir)
+			fs := http.FileServer(http.Dir(config.StaticDir))
+			router.PathPrefix("/").Handler(http.StripPrefix("/", fs))
 		}
 	}
 
@@ -167,24 +171,27 @@ func createCertManager(domains []string) *autocert.Manager {
 		Prompt:     autocert.AcceptTOS,
 		HostPolicy: autocert.HostWhitelist(domains...),
 		Cache:      autocert.DirCache("certs"),
-		Email:      "your-email@example.com", // Replace with your email
+		Email:      "info@d-tech.ge", // Replace with your email
 	}
 }
 
-func createReverseProxy(targetURL string) *httputil.ReverseProxy {
-	url, err := url.Parse(targetURL)
+func createReverseProxy(targetURL string) http.Handler {
+	log.Printf("creating reverse proxy for url: %s", targetURL)
+	target, err := url.Parse(targetURL)
 	if err != nil {
 		log.Fatalf("Error parsing proxy URL: %v", err)
 	}
-	proxy := httputil.NewSingleHostReverseProxy(url)
 
-	// Modify the Director function to handle WebSocket requests
+	// Create the reverse proxy
+	proxy := httputil.NewSingleHostReverseProxy(target)
+
+	// Customize the director
 	originalDirector := proxy.Director
 	proxy.Director = func(req *http.Request) {
 		originalDirector(req)
-
-		// Check if this is a WebSocket request
+		// Additional headers for WebSocket if needed
 		if websocket.IsWebSocketUpgrade(req) {
+			log.Printf("WebSocket upgrade requested for: %s", req.URL.Path)
 			req.Header.Set("Connection", "Upgrade")
 			req.Header.Set("Upgrade", "websocket")
 		}
@@ -196,7 +203,93 @@ func createReverseProxy(targetURL string) *httputil.ReverseProxy {
 		w.WriteHeader(http.StatusBadGateway)
 	}
 
-	return proxy
+	// Create a WebSocket upgrader
+	upgrader := websocket.Upgrader{
+		CheckOrigin: func(r *http.Request) bool {
+			return true // You might want to make this more restrictive
+		},
+	}
+
+	// Return a handler that can handle both WebSocket and HTTP requests
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if websocket.IsWebSocketUpgrade(r) {
+			log.Printf("Handling WebSocket request for: %s", r.URL.Path)
+			handleWebSocket(w, r, target, upgrader)
+		} else {
+			log.Printf("Handling HTTP request for: %s", r.URL.Path)
+			proxy.ServeHTTP(w, r)
+		}
+	})
+}
+
+func handleWebSocket(w http.ResponseWriter, r *http.Request, target *url.URL, upgrader websocket.Upgrader) {
+	// Upgrade the client connection
+	clientConn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		log.Printf("Error upgrading to WebSocket: %v", err)
+		return
+	}
+	defer clientConn.Close()
+
+	// Create the backend URL
+	backendURL := *r.URL
+	backendURL.Scheme = "ws"
+	if target.Scheme == "https" {
+		backendURL.Scheme = "wss"
+	}
+	backendURL.Host = target.Host
+
+	// Connect to the backend
+	dialer := websocket.Dialer{
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: false, // Set to true if needed for self-signed certs
+		},
+		HandshakeTimeout: 10 * time.Second,
+	}
+
+	log.Printf("Dialing backend WebSocket: %s", backendURL.String())
+	backendConn, _, err := dialer.Dial(backendURL.String(), nil)
+	if err != nil {
+		log.Printf("Error connecting to backend WebSocket: %v", err)
+		return
+	}
+	defer backendConn.Close()
+
+	// Create channels to handle closing
+	done := make(chan struct{})
+	defer close(done)
+
+	// Copy messages from client to backend
+	go func() {
+		for {
+			messageType, message, err := clientConn.ReadMessage()
+			if err != nil {
+				log.Printf("Error reading from client: %v", err)
+				return
+			}
+			err = backendConn.WriteMessage(messageType, message)
+			if err != nil {
+				log.Printf("Error writing to backend: %v", err)
+				return
+			}
+			log.Printf("Proxied message to backend: %d bytes", len(message))
+		}
+	}()
+
+	// Copy messages from backend to client
+	for {
+		messageType, message, err := backendConn.ReadMessage()
+		if err != nil {
+			log.Printf("Error reading from backend: %v", err)
+			return
+		}
+		err = clientConn.WriteMessage(messageType, message)
+		if err != nil {
+			log.Printf("Error writing to client: %v", err)
+			return
+		}
+		log.Printf("Proxied message to client: %d bytes", len(message))
+	}
 }
 
 func manageCertificates() {
