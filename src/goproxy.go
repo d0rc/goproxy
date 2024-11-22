@@ -189,6 +189,23 @@ func createReverseProxy(targetURL string) http.Handler {
 	originalDirector := proxy.Director
 	proxy.Director = func(req *http.Request) {
 		originalDirector(req)
+
+		// Get the client IP
+		clientIP := req.RemoteAddr
+		if colon := strings.LastIndex(clientIP, ":"); colon != -1 {
+			clientIP = clientIP[:colon]
+		}
+
+		// Get existing X-Forwarded-For header
+		forwardedFor := req.Header.Get("X-Forwarded-For")
+		if forwardedFor != "" {
+			// Append the client IP to the existing X-Forwarded-For value
+			req.Header.Set("X-Forwarded-For", forwardedFor+", "+clientIP)
+		} else {
+			// Set new X-Forwarded-For header with client IP
+			req.Header.Set("X-Forwarded-For", clientIP)
+		}
+		
 		// Additional headers for WebSocket if needed
 		if websocket.IsWebSocketUpgrade(req) {
 			log.Printf("WebSocket upgrade requested for: %s", req.URL.Path)
