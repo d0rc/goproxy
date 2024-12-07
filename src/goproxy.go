@@ -25,6 +25,10 @@ import (
 type DomainConfig struct {
 	StaticDir string
 	ProxyURLs map[string]string
+	BasicAuth struct {
+		Username string
+		Password string
+	}
 }
 
 var (
@@ -55,6 +59,11 @@ func main() {
 	// Set up routes for each domain
 	for domain, config := range domains {
 		router := mainRouter.Host(domain).Subrouter()
+
+		// Add basic auth middleware for this domain
+		router.Use(func(next http.Handler) http.Handler {
+			return basicAuthMiddleware(next, config)
+		})
 
 		// Set up proxy routes FIRST
 		for path, targetURL := range config.ProxyURLs {
@@ -138,6 +147,15 @@ func loadConfig(configFile string) error {
 			domains[currentDomain] = DomainConfig{
 				ProxyURLs: make(map[string]string),
 			}
+		case "auth":
+			authParts := strings.SplitN(value, " ", 2)
+			if len(authParts) != 2 {
+				return fmt.Errorf("invalid auth config: %s", value)
+			}
+			config := domains[currentDomain]
+			config.BasicAuth.Username = authParts[0]
+			config.BasicAuth.Password = authParts[1]
+			domains[currentDomain] = config
 		case "static_dir":
 			config := domains[currentDomain]
 			config.StaticDir = value
@@ -205,7 +223,7 @@ func createReverseProxy(targetURL string) http.Handler {
 			// Set new X-Forwarded-For header with client IP
 			req.Header.Set("X-Forwarded-For", clientIP)
 		}
-		
+
 		// Additional headers for WebSocket if needed
 		if websocket.IsWebSocketUpgrade(req) {
 			log.Printf("WebSocket upgrade requested for: %s", req.URL.Path)
@@ -391,4 +409,23 @@ func loggedGetCertificate(hello *tls.ClientHelloInfo) (*tls.Certificate, error) 
 
 func logConnState(conn net.Conn, state http.ConnState) {
 	log.Printf("Connection state changed: %s -> %s", conn.RemoteAddr(), state)
+}
+
+func basicAuthMiddleware(next http.Handler, config DomainConfig) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Skip auth check if no auth is configured
+		if config.BasicAuth.Username == "" && config.BasicAuth.Password == "" {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		username, password, ok := r.BasicAuth()
+		if !ok || username != config.BasicAuth.Username || password != config.BasicAuth.Password {
+			w.Header().Set("WWW-Authenticate", `Basic realm="Restricted"`)
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+
+		next.ServeHTTP(w, r)
+	})
 }
