@@ -16,6 +16,9 @@ import (
 	"sync"
 	"time"
 
+	"compress/gzip"
+	"io"
+
 	"github.com/gorilla/mux"
 	"github.com/gorilla/websocket"
 	"golang.org/x/crypto/acme"
@@ -23,9 +26,10 @@ import (
 )
 
 type DomainConfig struct {
-	StaticDir string
-	ProxyURLs map[string]string
-	BasicAuth struct {
+	StaticDir    string
+	ProxyURLs    map[string]string
+	FallbackPath string
+	BasicAuth    struct {
 		Username string
 		Password string
 	}
@@ -35,6 +39,15 @@ var (
 	domains     map[string]DomainConfig
 	certManager *autocert.Manager
 )
+
+type gzipResponseWriter struct {
+	io.Writer
+	http.ResponseWriter
+}
+
+func (g gzipResponseWriter) Write(b []byte) (int, error) {
+	return g.Writer.Write(b)
+}
 
 func main() {
 	// Parse command-line flags
@@ -53,7 +66,8 @@ func main() {
 	// Create the main router
 	mainRouter := mux.NewRouter()
 
-	// Add logging middleware
+	// Add compression middleware BEFORE logging middleware
+	mainRouter.Use(compressionMiddleware)
 	mainRouter.Use(loggingMiddleware)
 
 	// Set up routes for each domain
@@ -74,9 +88,16 @@ func main() {
 
 		// Set up static file serving LAST
 		if config.StaticDir != "" {
-			log.Printf("Setting up static file serving for domain %s from directory: %s", domain, config.StaticDir)
-			fs := http.FileServer(http.Dir(config.StaticDir))
-			router.PathPrefix("/").Handler(http.StripPrefix("/", fs))
+			if config.FallbackPath == "" {
+				log.Printf("Setting up static file serving for domain %s from directory: %s", domain, config.StaticDir)
+				fs := http.FileServer(http.Dir(config.StaticDir))
+				router.PathPrefix("/").Handler(http.StripPrefix("/", fs))
+			} else {
+				log.Printf("Setting up static file serving for domain %s from directory: %s with fallback at %s", domain, config.StaticDir, config.FallbackPath)
+				// Use the custom file server handler with the configured fallback path
+				fs := customFileServer(http.Dir(config.StaticDir), config.FallbackPath)
+				router.PathPrefix("/").Handler(http.StripPrefix("/", fs))
+			}
 		}
 	}
 
@@ -167,6 +188,10 @@ func loadConfig(configFile string) error {
 			}
 			config := domains[currentDomain]
 			config.ProxyURLs[proxyParts[0]] = proxyParts[1]
+			domains[currentDomain] = config
+		case "fallback_path":
+			config := domains[currentDomain]
+			config.FallbackPath = value
 			domains[currentDomain] = config
 		default:
 			return fmt.Errorf("unknown config key: %s", key)
@@ -327,6 +352,25 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request, target *url.URL, up
 	}
 }
 
+func customFileServer(root http.FileSystem, fallback string) http.Handler {
+	fs := http.FileServer(root)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Try to serve the requested file
+		path := r.URL.Path
+		f, err := root.Open(path)
+		if err != nil {
+			if os.IsNotExist(err) {
+				// If the file doesn't exist, serve the fallback file
+				r.URL.Path = fallback
+			}
+		} else {
+			// Close the file if it was successfully opened
+			f.Close()
+		}
+		fs.ServeHTTP(w, r)
+	})
+}
+
 func manageCertificates() {
 	var wg sync.WaitGroup
 	for domain := range domains {
@@ -427,5 +471,22 @@ func basicAuthMiddleware(next http.Handler, config DomainConfig) http.Handler {
 		}
 
 		next.ServeHTTP(w, r)
+	})
+}
+
+func compressionMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Check if client accepts gzip
+		if !strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		// Set up gzip writer
+		w.Header().Set("Content-Encoding", "gzip")
+		gz := gzip.NewWriter(w)
+		defer gz.Close()
+
+		next.ServeHTTP(gzipResponseWriter{Writer: gz, ResponseWriter: w}, r)
 	})
 }
