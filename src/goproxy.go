@@ -29,6 +29,7 @@ type DomainConfig struct {
 	StaticDir    string
 	ProxyURLs    map[string]string
 	FallbackPath string
+	RedirectTo   string
 	BasicAuth    struct {
 		Username string
 		Password string
@@ -73,6 +74,19 @@ func main() {
 	// Set up routes for each domain
 	for domain, config := range domains {
 		router := mainRouter.Host(domain).Subrouter()
+
+		// Handle redirect first, if configured
+		if config.RedirectTo != "" {
+			log.Printf("Setting up redirect for domain %s to %s", domain, config.RedirectTo)
+			router.PathPrefix("/").Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				newURL := "https://" + config.RedirectTo + r.URL.Path
+				if r.URL.RawQuery != "" {
+					newURL += "?" + r.URL.RawQuery
+				}
+				http.Redirect(w, r, newURL, http.StatusMovedPermanently)
+			}))
+			continue // Skip other handlers for this domain
+		}
 
 		// Add basic auth middleware for this domain
 		router.Use(func(next http.Handler) http.Handler {
@@ -192,6 +206,10 @@ func loadConfig(configFile string) error {
 		case "fallback_path":
 			config := domains[currentDomain]
 			config.FallbackPath = value
+			domains[currentDomain] = config
+		case "redirect":
+			config := domains[currentDomain]
+			config.RedirectTo = value
 			domains[currentDomain] = config
 		default:
 			return fmt.Errorf("unknown config key: %s", key)
