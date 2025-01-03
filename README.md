@@ -170,6 +170,11 @@ WantedBy=multi-user.target
 - Consider rate limiting for production use
 - Keep backup of certificates and configuration
 
+## Resources
+
+- [GoProxy: Hosting Static and Dynamic Sites with Ease](https://legacysupportteam.com/blog/goproxy-hosting-static-dynamic-sites/) - A comprehensive guide on using GoProxy for static and dynamic site hosting
+- [GitHub Repository](https://github.com/d0rc/goproxy)
+
 ## Contributing
 
 Contributions are welcome! Please feel free to submit pull requests. For major changes, please open an issue first to discuss what you would like to change.
