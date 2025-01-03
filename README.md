@@ -49,6 +49,9 @@ The configuration file uses a simple key-value format:
 - `proxy`: Format is `proxy=<path> <target_url>` where:
     - `path`: URL path to match
     - `target_url`: Destination URL to proxy (supports both HTTP and WebSocket)
+- `auth`: Format is `auth=<username> <password>` for Basic Authentication
+- `fallback_path`: Path to serve when a static file is not found (e.g., for SPA routing)
+- `redirect`: Redirects all requests to the specified domain while preserving paths and query parameters
 
 ### Example Configuration
 
@@ -58,10 +61,17 @@ domain=example.com
 static_dir=/var/www/main
 proxy=/api https://api.internal:8080
 proxy=/ws ws://websocket.internal:8081
+fallback_path=/index.html
 
-# Blog subdomain
-domain=blog.example.com
-static_dir=/var/www/blog
+# Redirect www subdomain to naked domain
+# A request to www.example.com/blog?page=2 will redirect to example.com/blog?page=2
+domain=www.example.com
+redirect=example.com
+
+# Admin panel
+domain=admin.example.com
+static_dir=/var/www/admin
+auth=adminuser strongpassword
 ```
 
 ## Features in Detail
