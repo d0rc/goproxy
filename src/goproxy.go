@@ -50,6 +50,8 @@ func (g gzipResponseWriter) Write(b []byte) (int, error) {
 	return g.Writer.Write(b)
 }
 
+var email = flag.String("account-email", "info@d-tech.ge", "Put your e-mail here for SSL account registration:)")
+
 func main() {
 	// Parse command-line flags
 	configFile := flag.String("config", "config.txt", "Path to the configuration file")
@@ -61,8 +63,10 @@ func main() {
 		log.Fatalf("Error loading configuration: %v", err)
 	}
 
+	log.Printf("Starting with config at %s and account email %s\n", *configFile, *email)
+
 	// Initialize autocert manager
-	certManager = createCertManager(getDomainNames())
+	certManager = createCertManager(*email, getDomainNames())
 
 	// Create the main router
 	mainRouter := mux.NewRouter()
@@ -227,12 +231,12 @@ func getDomainNames() []string {
 	return names
 }
 
-func createCertManager(domains []string) *autocert.Manager {
+func createCertManager(email string, domains []string) *autocert.Manager {
 	return &autocert.Manager{
 		Prompt:     autocert.AcceptTOS,
 		HostPolicy: autocert.HostWhitelist(domains...),
 		Cache:      autocert.DirCache("certs"),
-		Email:      "info@d-tech.ge", // Replace with your email
+		Email:      email,
 	}
 }
 
