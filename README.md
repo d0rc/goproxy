@@ -13,6 +13,10 @@ A lightweight, feature-rich HTTPS reverse proxy server written in Go, with autom
 - 📁 Static file serving
 - 📝 Detailed logging
 - ⚡ High performance with Go's concurrency
+- 🗜️ Intelligent content compression (gzip)
+- 🔑 Basic authentication support per domain
+- 🔄 Domain-level redirects
+- 🎯 Custom fallback paths for SPAs
 
 ## Quick Start
 
@@ -53,6 +57,12 @@ The configuration file uses a simple key-value format:
 - `fallback_path`: Path to serve when a static file is not found (e.g., for SPA routing)
 - `redirect`: Redirects all requests to the specified domain while preserving paths and query parameters
 
+The proxy automatically handles content compression (gzip) for appropriate content types including:
+- Text files (HTML, CSS, JavaScript, etc.)
+- JSON and XML responses
+- Form-encoded data
+- While skipping already-compressed content (images, videos, archives)
+
 ### Example Configuration
 
 ```txt
@@ -72,6 +82,15 @@ redirect=example.com
 domain=admin.example.com
 static_dir=/var/www/admin
 auth=adminuser strongpassword
+
+# Complete example showing all features
+domain=example.com
+static_dir=/var/www/main
+proxy=/api https://api.internal:8080
+proxy=/ws ws://websocket.internal:8081
+fallback_path=/index.html
+auth=admin secretpassword
+redirect=example.com   # Optional redirect target
 ```
 
 ## Features in Detail
@@ -194,3 +213,9 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 - The Go team for the excellent standard library
 - Gorilla toolkit developers
 - Let's Encrypt for providing free SSL certificates
+
+## Command Line Options
+
+The following command-line options are available:
+- `-config`: Path to the configuration file (default: "config.txt")
+- `-account-email`: Email address for Let's Encrypt registration
