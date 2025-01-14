@@ -2,6 +2,7 @@ package main
 
 // -build-me-for: linux
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"flag"
@@ -17,7 +18,6 @@ import (
 	"time"
 
 	"compress/gzip"
-	"io"
 
 	"github.com/gorilla/mux"
 	"github.com/gorilla/websocket"
@@ -41,13 +41,42 @@ var (
 	certManager *autocert.Manager
 )
 
+// gzipResponseWriter implements http.ResponseWriter with proper gzip handling
 type gzipResponseWriter struct {
-	io.Writer
 	http.ResponseWriter
+	gzWriter *gzip.Writer
+	status   int
 }
 
-func (g gzipResponseWriter) Write(b []byte) (int, error) {
-	return g.Writer.Write(b)
+func (g *gzipResponseWriter) Write(b []byte) (int, error) {
+	return g.gzWriter.Write(b)
+}
+
+func (g *gzipResponseWriter) WriteHeader(status int) {
+	g.status = status
+	g.ResponseWriter.WriteHeader(status)
+}
+
+func (g *gzipResponseWriter) Flush() {
+	if flusher, ok := g.ResponseWriter.(http.Flusher); ok {
+		g.gzWriter.Flush()
+		flusher.Flush()
+	}
+}
+
+// responseWrapper captures the response to check content type before deciding to compress
+type responseWrapper struct {
+	http.ResponseWriter
+	status int
+	body   bytes.Buffer
+}
+
+func (w *responseWrapper) WriteHeader(status int) {
+	w.status = status
+}
+
+func (w *responseWrapper) Write(b []byte) (int, error) {
+	return w.body.Write(b)
 }
 
 var email = flag.String("account-email", "info@d-tech.ge", "Put your e-mail here for SSL account registration:)")
@@ -496,19 +525,115 @@ func basicAuthMiddleware(next http.Handler, config DomainConfig) http.Handler {
 	})
 }
 
+// shouldCompress checks if the content type should be compressed
+func shouldCompress(contentType string) bool {
+	// Extract the base content type without parameters
+	if semicolon := strings.Index(contentType, ";"); semicolon != -1 {
+		contentType = contentType[:semicolon]
+	}
+	contentType = strings.TrimSpace(strings.ToLower(contentType))
+
+	// List of content types that are already compressed or shouldn't be compressed
+	skipCompression := map[string]bool{
+		"image/png":                    true,
+		"image/jpeg":                   true,
+		"image/gif":                    true,
+		"image/webp":                   true,
+		"image/avif":                   true,
+		"video/":                       true,
+		"audio/":                       true,
+		"application/zip":              true,
+		"application/gzip":             true,
+		"application/x-gzip":           true,
+		"application/x-compress":       true,
+		"application/x-compressed":     true,
+		"application/x-zip-compressed": true,
+		"application/octet-stream":     true,
+	}
+
+	// Check if content type starts with any of the skip prefixes
+	for prefix := range skipCompression {
+		if strings.HasPrefix(contentType, prefix) {
+			return false
+		}
+	}
+
+	// Only compress known compressible types
+	return strings.HasPrefix(contentType, "text/") ||
+		contentType == "application/json" ||
+		contentType == "application/javascript" ||
+		contentType == "application/xml" ||
+		contentType == "application/x-www-form-urlencoded" ||
+		strings.HasSuffix(contentType, "+json") ||
+		strings.HasSuffix(contentType, "+xml")
+}
+
 func compressionMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Skip compression for WebSocket connections
+		if websocket.IsWebSocketUpgrade(r) {
+			next.ServeHTTP(w, r)
+			return
+		}
+
 		// Check if client accepts gzip
 		if !strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
 			next.ServeHTTP(w, r)
 			return
 		}
 
-		// Set up gzip writer
-		w.Header().Set("Content-Encoding", "gzip")
-		gz := gzip.NewWriter(w)
-		defer gz.Close()
+		// Create wrapper to capture Content-Type header
+		wrapper := &responseWrapper{ResponseWriter: w}
 
-		next.ServeHTTP(gzipResponseWriter{Writer: gz, ResponseWriter: w}, r)
+		// Call the next handler to potentially set Content-Type
+		next.ServeHTTP(wrapper, r)
+
+		// After headers are written, check if we should compress
+		contentType := wrapper.Header().Get("Content-Type")
+		if contentType == "" {
+			// If no content type is set, try to detect it
+			contentType = http.DetectContentType(wrapper.body.Bytes())
+		}
+
+		if !shouldCompress(contentType) {
+			// If we shouldn't compress, write the original response
+			for k, v := range wrapper.Header() {
+				w.Header()[k] = v
+			}
+			w.WriteHeader(wrapper.status)
+			w.Write(wrapper.body.Bytes())
+			return
+		}
+
+		// Set up gzip writer
+		gz := gzip.NewWriter(w)
+		gzw := &gzipResponseWriter{
+			ResponseWriter: w,
+			gzWriter:       gz,
+		}
+
+		// Ensure gzip writer is closed properly
+		defer func() {
+			if gzw.status != http.StatusNoContent {
+				gz.Close()
+			}
+		}()
+
+		// Copy all headers
+		for k, v := range wrapper.Header() {
+			w.Header()[k] = v
+		}
+
+		// Set the Content-Encoding header
+		w.Header().Set("Content-Encoding", "gzip")
+
+		// Remove Content-Length header since it will no longer be valid
+		w.Header().Del("Content-Length")
+
+		// Write the captured response with compression
+		if wrapper.status != 0 {
+			gzw.WriteHeader(wrapper.status)
+		}
+		gzw.Write(wrapper.body.Bytes())
 	})
 }
