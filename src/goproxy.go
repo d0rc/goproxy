@@ -25,6 +25,10 @@ import (
 	"golang.org/x/crypto/acme/autocert"
 )
 
+var (
+	disableCompression = flag.Bool("disable-compression", false, "Disable gzip compression entirely")
+)
+
 type DomainConfig struct {
 	StaticDir    string
 	ProxyURLs    map[string]string
@@ -570,6 +574,12 @@ func shouldCompress(contentType string) bool {
 
 func compressionMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Check if compression is globally disabled
+		if *disableCompression {
+			next.ServeHTTP(w, r)
+			return
+		}
+
 		// Skip compression for WebSocket connections
 		if websocket.IsWebSocketUpgrade(r) {
 			next.ServeHTTP(w, r)
