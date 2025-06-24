@@ -2,12 +2,15 @@ package main
 
 // -build-me-for: linux
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/tls"
+	_ "embed"
 	"flag"
 	"fmt"
 	"log"
+	"mime"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -28,6 +31,9 @@ import (
 var (
 	disableCompression = flag.Bool("disable-compression", false, "Disable gzip compression entirely")
 )
+
+//go:embed mime.types
+var mimeTypesData string
 
 type DomainConfig struct {
 	StaticDir    string
@@ -95,6 +101,9 @@ func main() {
 	if err != nil {
 		log.Fatalf("Error loading configuration: %v", err)
 	}
+
+	// Load custom MIME types
+	loadMimeTypes()
 
 	log.Printf("Starting with config at %s and account email %s\n", *configFile, *email)
 
@@ -186,6 +195,25 @@ func main() {
 	// Start the HTTPS server
 	log.Println("Starting HTTPS server on :443")
 	log.Fatal(server.ListenAndServeTLS("", ""))
+}
+
+func loadMimeTypes() {
+	scanner := bufio.NewScanner(strings.NewReader(mimeTypesData))
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.HasPrefix(line, "#") || line == "" {
+			continue
+		}
+		parts := strings.Fields(line)
+		if len(parts) == 2 {
+			if err := mime.AddExtensionType(parts[0], parts[1]); err != nil {
+				log.Printf("Warning: Could not add MIME type for %s: %v", parts[0], err)
+			}
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		log.Printf("Warning: Error reading embedded MIME types: %v", err)
+	}
 }
 
 func loadConfig(configFile string) error {
@@ -574,8 +602,11 @@ func shouldCompress(contentType string) bool {
 
 func compressionMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Check if compression is globally disabled
-		if *disableCompression {
+		// Always add Vary header when Accept-Encoding is present
+		w.Header().Add("Vary", "Accept-Encoding")
+
+		// Check if compression is globally disabled or client doesn't accept gzip
+		if *disableCompression || !strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -586,36 +617,7 @@ func compressionMiddleware(next http.Handler) http.Handler {
 			return
 		}
 
-		// Check if client accepts gzip
-		if !strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
-			next.ServeHTTP(w, r)
-			return
-		}
-
-		// Create wrapper to capture Content-Type header
-		wrapper := &responseWrapper{ResponseWriter: w}
-
-		// Call the next handler to potentially set Content-Type
-		next.ServeHTTP(wrapper, r)
-
-		// After headers are written, check if we should compress
-		contentType := wrapper.Header().Get("Content-Type")
-		if contentType == "" {
-			// If no content type is set, try to detect it
-			contentType = http.DetectContentType(wrapper.body.Bytes())
-		}
-
-		if !shouldCompress(contentType) {
-			// If we shouldn't compress, write the original response
-			for k, v := range wrapper.Header() {
-				w.Header()[k] = v
-			}
-			w.WriteHeader(wrapper.status)
-			w.Write(wrapper.body.Bytes())
-			return
-		}
-
-		// Set up gzip writer
+		// Create a new gzipResponseWriter
 		gz := gzip.NewWriter(w)
 		gzw := &gzipResponseWriter{
 			ResponseWriter: w,
@@ -624,23 +626,54 @@ func compressionMiddleware(next http.Handler) http.Handler {
 
 		// Ensure gzip writer is closed properly
 		defer func() {
-			if gzw.status != http.StatusNoContent {
+			// Only close if a body was written
+			if gzw.status != http.StatusNoContent && gzw.status != 0 {
 				gz.Close()
 			}
 		}()
 
-		// Copy all headers
-		for k, v := range wrapper.Header() {
-			w.Header()[k] = v
+		// Wrap the original response writer
+		wrapper := &responseWrapper{ResponseWriter: gzw}
+
+		// Call the next handler
+		next.ServeHTTP(wrapper, r)
+
+		// After the handler has run, check headers
+		contentType := wrapper.Header().Get("Content-Type")
+		contentEncoding := wrapper.Header().Get("Content-Encoding")
+		contentLength := wrapper.Header().Get("Content-Length")
+
+		// If Content-Type is not set, detect it from the body
+		if contentType == "" {
+			contentType = http.DetectContentType(wrapper.body.Bytes())
+			wrapper.Header().Set("Content-Type", contentType)
 		}
 
-		// Set the Content-Encoding header
+		// Do not compress if:
+		// 1. Content is already encoded
+		// 2. Content-Type is not compressible
+		// 3. Content-Length is 0
+		if contentEncoding != "" || !shouldCompress(contentType) || contentLength == "0" {
+			// If we're not compressing, we need to write the original, uncompressed response.
+			// This requires writing headers and body to the original writer.
+			gzw.gzWriter.Reset(w) // Discard the gzip writer
+			for k, v := range wrapper.Header() {
+				w.Header()[k] = v
+			}
+			if wrapper.status != 0 {
+				w.WriteHeader(wrapper.status)
+			}
+			w.Write(wrapper.body.Bytes())
+			return
+		}
+
+		// If we are compressing, set the Content-Encoding header
 		w.Header().Set("Content-Encoding", "gzip")
 
-		// Remove Content-Length header since it will no longer be valid
+		// Remove Content-Length as it's now invalid
 		w.Header().Del("Content-Length")
 
-		// Write the captured response with compression
+		// Write the status code and the compressed body
 		if wrapper.status != 0 {
 			gzw.WriteHeader(wrapper.status)
 		}
