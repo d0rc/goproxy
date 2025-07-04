@@ -320,7 +320,8 @@ func createReverseProxy(targetURL string) http.Handler {
 		originalDirector(req)
 
 		// Set the Host header to the original host
-		req.Host = req.URL.Host
+		//req.Host = req.URL.Host
+		//log.Printf("Using HOST [%s - %s] for request\n", req.Host, req.URL.Host)
 
 		// Get the client IP
 		clientIP := req.RemoteAddr
