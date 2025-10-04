@@ -262,7 +262,7 @@ func main() {
 	// Set up the TLS configuration
 	tlsConfig := &tls.Config{
 		GetCertificate: loggedGetCertificate,
-		NextProtos:     []string{"http/1.1", acme.ALPNProto},
+		NextProtos:     []string{"h2", "http/1.1", acme.ALPNProto},
 	}
 
 	// Set up the HTTPS server with proper timeouts
