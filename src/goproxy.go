@@ -57,6 +57,9 @@ type compressResponseWriter struct {
 	gzWriter    *gzip.Writer
 	wroteHeader bool
 	doCompress  bool
+	isStreaming bool
+	wroteBody   bool // Track if we actually wrote any body data
+	statusCode  int  // Track the status code
 }
 
 func (w *compressResponseWriter) WriteHeader(status int) {
@@ -64,12 +67,26 @@ func (w *compressResponseWriter) WriteHeader(status int) {
 		return
 	}
 	w.wroteHeader = true
+	w.statusCode = status
 
 	contentType := w.Header().Get("Content-Type")
 	contentEncoding := w.Header().Get("Content-Encoding")
 
-	// Do not compress for SSE or if already compressed
-	if strings.Contains(contentType, "text/event-stream") || contentEncoding != "" {
+	// Check if this is a streaming response
+	w.isStreaming = strings.Contains(contentType, "text/event-stream") ||
+		strings.Contains(contentType, "application/octet-stream") ||
+		w.Header().Get("X-Content-Type-Options") == "nosniff"
+
+	// Check if this status code allows a body
+	statusAllowsBody := status != http.StatusNoContent && 
+		status != http.StatusNotModified && 
+		status != http.StatusContinue && 
+		status != http.StatusSwitchingProtocols && 
+		status != http.StatusProcessing && 
+		status != http.StatusEarlyHints
+
+	// Do not compress for SSE, streaming responses, status codes without body, or if already compressed
+	if !statusAllowsBody || w.isStreaming || contentEncoding != "" {
 		w.doCompress = false
 		w.ResponseWriter.WriteHeader(status)
 		return
@@ -79,7 +96,16 @@ func (w *compressResponseWriter) WriteHeader(status int) {
 	if shouldCompress(contentType) {
 		w.Header().Set("Content-Encoding", "gzip")
 		w.Header().Del("Content-Length")
+		// Explicitly set chunked encoding when compressing
+		w.Header().Set("Transfer-Encoding", "chunked")
 		w.doCompress = true
+		// Only set Vary header when actually compressing
+		existing := w.Header().Get("Vary")
+		if existing != "" && !strings.Contains(existing, "Accept-Encoding") {
+			w.Header().Set("Vary", existing+", Accept-Encoding")
+		} else if existing == "" {
+			w.Header().Set("Vary", "Accept-Encoding")
+		}
 	}
 	w.ResponseWriter.WriteHeader(status)
 }
@@ -88,25 +114,61 @@ func (w *compressResponseWriter) Write(b []byte) (int, error) {
 	if !w.wroteHeader {
 		w.WriteHeader(http.StatusOK)
 	}
-	if w.doCompress {
-		return w.gzWriter.Write(b)
+	
+	// Don't write anything if the status code doesn't allow a body
+	if len(b) == 0 {
+		return 0, nil
 	}
-	return w.ResponseWriter.Write(b)
+	
+	w.wroteBody = true
+	
+	var n int
+	var err error
+	
+	if w.doCompress && w.gzWriter != nil {
+		n, err = w.gzWriter.Write(b)
+		if err == nil {
+			// Always flush for streaming responses
+			if w.isStreaming {
+				w.gzWriter.Flush()
+				if flusher, ok := w.ResponseWriter.(http.Flusher); ok {
+					flusher.Flush()
+				}
+			} else if n > 0 && n < 1024 {
+				// For small writes, flush immediately to prevent buffering issues
+				// This helps with mobile browsers that expect immediate data
+				w.gzWriter.Flush()
+			}
+		}
+	} else {
+		n, err = w.ResponseWriter.Write(b)
+		// Flush for streaming responses
+		if err == nil && w.isStreaming {
+			if flusher, ok := w.ResponseWriter.(http.Flusher); ok {
+				flusher.Flush()
+			}
+		}
+	}
+	
+	return n, err
 }
 
 func (w *compressResponseWriter) Flush() {
+	// Always flush the gzip writer first if compressing
+	if w.doCompress && w.gzWriter != nil {
+		w.gzWriter.Flush()
+	}
+	// Then flush the underlying response writer
 	if flusher, ok := w.ResponseWriter.(http.Flusher); ok {
-		if w.doCompress {
-			w.gzWriter.Flush()
-		}
 		flusher.Flush()
 	}
 }
 
-func (w *compressResponseWriter) Close() {
-	if w.gzWriter != nil {
-		w.gzWriter.Close()
-	}
+func (w *compressResponseWriter) Close() error {
+	// This method is now primarily called from compressionMiddleware
+	// The middleware handles the actual flush and close sequence
+	// This is kept for compatibility but the main work is done in the middleware
+	return nil
 }
 
 var email = flag.String("account-email", "info@d-tech.ge", "Put your e-mail here for SSL account registration:)")
@@ -187,25 +249,36 @@ func main() {
 		NextProtos:     []string{"h2", "http/1.1", acme.ALPNProto},
 	}
 
-	// Set up the HTTPS server
+	// Set up the HTTPS server with proper timeouts
 	server := &http.Server{
 		Addr:      ":https",
 		Handler:   mainRouter,
 		TLSConfig: tlsConfig,
 		ErrorLog:  log.New(os.Stderr, "HTTPS Server Error: ", log.Ldate|log.Ltime|log.Lshortfile),
 		ConnState: logConnState,
+		// Timeouts for better connection management
+		ReadTimeout:       30 * time.Second,
+		ReadHeaderTimeout: 10 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    1 << 20, // 1 MB
 	}
 
 	// Start certificate management
 	go manageCertificates()
 
-	// Start HTTP-01 challenge server
+	// Start HTTP-01 challenge server with timeouts
 	go func() {
 		log.Println("Starting HTTP server for ACME challenges on :80")
 		httpServer := &http.Server{
-			Addr:      ":http",
-			Handler:   wrapHandlerWithLogging(certManager.HTTPHandler(nil)),
-			ConnState: logConnState,
+			Addr:              ":http",
+			Handler:           wrapHandlerWithLogging(certManager.HTTPHandler(nil)),
+			ConnState:         logConnState,
+			ReadTimeout:       10 * time.Second,
+			ReadHeaderTimeout: 5 * time.Second,
+			WriteTimeout:      10 * time.Second,
+			IdleTimeout:       60 * time.Second,
+			MaxHeaderBytes:    1 << 20, // 1 MB
 		}
 		if err := httpServer.ListenAndServe(); err != nil {
 			log.Fatalf("HTTP server error: %v", err)
@@ -321,6 +394,31 @@ func createCertManager(email string, domains []string) *autocert.Manager {
 	}
 }
 
+// flushingResponseWriter wraps http.ResponseWriter to ensure proper flushing
+type flushingResponseWriter struct {
+	http.ResponseWriter
+	flusher http.Flusher
+}
+
+func (w *flushingResponseWriter) Flush() {
+	if w.flusher != nil {
+		w.flusher.Flush()
+	}
+}
+
+// singleJoiningSlash joins two URL paths with a single slash
+func singleJoiningSlash(a, b string) string {
+	aslash := strings.HasSuffix(a, "/")
+	bslash := strings.HasPrefix(b, "/")
+	switch {
+	case aslash && bslash:
+		return a + b[1:]
+	case !aslash && !bslash:
+		return a + "/" + b
+	}
+	return a + b
+}
+
 func createReverseProxy(targetURL string) http.Handler {
 	log.Printf("creating reverse proxy for url: %s", targetURL)
 	target, err := url.Parse(targetURL)
@@ -328,20 +426,45 @@ func createReverseProxy(targetURL string) http.Handler {
 		log.Fatalf("Error parsing proxy URL: %v", err)
 	}
 
-	// Create the reverse proxy
-	proxy := httputil.NewSingleHostReverseProxy(target)
+	// Create the reverse proxy with custom transport for better timeout control
+	transport := &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          100,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+		ResponseHeaderTimeout: 30 * time.Second,
+	}
 
-	// Set FlushInterval to -1 to disable buffering
-	proxy.FlushInterval = -1
+	proxy := &httputil.ReverseProxy{
+		Director: func(req *http.Request) {
+			req.URL.Scheme = target.Scheme
+			req.URL.Host = target.Host
+			req.URL.Path = singleJoiningSlash(target.Path, req.URL.Path)
+			if target.RawQuery == "" || req.URL.RawQuery == "" {
+				req.URL.RawQuery = target.RawQuery + req.URL.RawQuery
+			} else {
+				req.URL.RawQuery = target.RawQuery + "&" + req.URL.RawQuery
+			}
+			if _, ok := req.Header["User-Agent"]; !ok {
+				// explicitly disable User-Agent so it's not set to default value
+				req.Header.Set("User-Agent", "")
+			}
+		},
+		Transport: transport,
+		// Enable immediate flushing for streaming responses
+		FlushInterval: 100 * time.Millisecond,
+	}
 
 	// Customize the director
 	originalDirector := proxy.Director
 	proxy.Director = func(req *http.Request) {
 		originalDirector(req)
-
-		// Set the Host header to the original host
-		//req.Host = req.URL.Host
-		//log.Printf("Using HOST [%s - %s] for request\n", req.Host, req.URL.Host)
 
 		// Get the client IP
 		clientIP := req.RemoteAddr
@@ -364,14 +487,41 @@ func createReverseProxy(targetURL string) http.Handler {
 		}
 	}
 
-	// Add error handling
-	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
-		log.Printf("Proxy error: %v", err)
-		w.WriteHeader(http.StatusBadGateway)
+	// Custom ModifyResponse to handle streaming
+	proxy.ModifyResponse = func(resp *http.Response) error {
+		// Check if this is a streaming response
+		contentType := resp.Header.Get("Content-Type")
+		if strings.Contains(contentType, "text/event-stream") ||
+			strings.Contains(contentType, "application/octet-stream") {
+			// Ensure proper headers for streaming
+			resp.Header.Set("Cache-Control", "no-cache")
+			resp.Header.Set("Connection", "keep-alive")
+			resp.Header.Del("Content-Length")
+			resp.Header.Set("Transfer-Encoding", "chunked")
+		}
+		return nil
 	}
 
-	// The reverse proxy will handle both HTTP and WebSocket requests automatically
-	return proxy
+	// Add error handling
+	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
+		log.Printf("Proxy error for %s: %v", r.URL.Path, err)
+		w.WriteHeader(http.StatusBadGateway)
+		fmt.Fprintf(w, "Proxy error: %v", err)
+	}
+
+	// Wrap the proxy to ensure proper flushing
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Check if the ResponseWriter supports flushing
+		if flusher, ok := w.(http.Flusher); ok {
+			fw := &flushingResponseWriter{
+				ResponseWriter: w,
+				flusher:        flusher,
+			}
+			proxy.ServeHTTP(fw, r)
+		} else {
+			proxy.ServeHTTP(w, r)
+		}
+	})
 }
 
 func customFileServer(root http.FileSystem, fallback string) http.Handler {
@@ -541,20 +691,70 @@ func shouldCompress(contentType string) bool {
 
 func compressionMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Add("Vary", "Accept-Encoding")
-
-		if *disableCompression || !strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") || websocket.IsWebSocketUpgrade(r) {
+		// Early detection of special protocols
+		isWebSocket := websocket.IsWebSocketUpgrade(r)
+		isSSE := r.Header.Get("Accept") == "text/event-stream"
+		isStreaming := strings.Contains(r.URL.Path, "/stream") || 
+			strings.Contains(r.Header.Get("Accept"), "text/event-stream")
+		
+		// Skip compression for special cases
+		if *disableCompression || isWebSocket || isSSE || isStreaming {
+			next.ServeHTTP(w, r)
+			return
+		}
+		
+		// Check if client accepts gzip
+		if !strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
 			next.ServeHTTP(w, r)
 			return
 		}
 
-		gz := gzip.NewWriter(w)
-		crw := &compressResponseWriter{
-			ResponseWriter: w,
-			gzWriter:       gz,
+		// Don't set Vary header here - let the compressResponseWriter decide
+		// Check if this is a HEAD request
+		isHEAD := r.Method == http.MethodHead
+		
+		var crw *compressResponseWriter
+		if !isHEAD {
+			gz := gzip.NewWriter(w)
+			crw = &compressResponseWriter{
+				ResponseWriter: w,
+				gzWriter:       gz,
+				wroteBody:      false,
+				statusCode:     http.StatusOK,
+			}
+		} else {
+			// For HEAD requests, don't create a gzip writer at all
+			crw = &compressResponseWriter{
+				ResponseWriter: w,
+				gzWriter:       nil,
+				doCompress:     false,
+				wroteBody:      false,
+				statusCode:     http.StatusOK,
+			}
 		}
-		defer crw.Close()
 
+		// Serve the request
 		next.ServeHTTP(crw, r)
+		
+		// After handler completes, ensure all data is flushed before response ends
+		// This is critical for small responses that might be buffered
+		if crw.doCompress && crw.gzWriter != nil && crw.wroteBody {
+			// Flush any remaining compressed data
+			if err := crw.gzWriter.Flush(); err != nil {
+				log.Printf("Error flushing gzip writer: %v", err)
+			}
+			// Close the gzip writer to write the trailer
+			if err := crw.gzWriter.Close(); err != nil {
+				// Only log if it's not the expected "no body allowed" error
+				if !strings.Contains(err.Error(), "does not allow body") {
+					log.Printf("Error closing gzip writer: %v", err)
+				}
+			}
+		}
+		
+		// Ensure the response is fully sent to the client
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
 	})
 }
