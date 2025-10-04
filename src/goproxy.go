@@ -78,11 +78,11 @@ func (w *compressResponseWriter) WriteHeader(status int) {
 		w.Header().Get("X-Content-Type-Options") == "nosniff"
 
 	// Check if this status code allows a body
-	statusAllowsBody := status != http.StatusNoContent && 
-		status != http.StatusNotModified && 
-		status != http.StatusContinue && 
-		status != http.StatusSwitchingProtocols && 
-		status != http.StatusProcessing && 
+	statusAllowsBody := status != http.StatusNoContent &&
+		status != http.StatusNotModified &&
+		status != http.StatusContinue &&
+		status != http.StatusSwitchingProtocols &&
+		status != http.StatusProcessing &&
 		status != http.StatusEarlyHints
 
 	// Do not compress for SSE, streaming responses, status codes without body, or if already compressed
@@ -114,17 +114,17 @@ func (w *compressResponseWriter) Write(b []byte) (int, error) {
 	if !w.wroteHeader {
 		w.WriteHeader(http.StatusOK)
 	}
-	
+
 	// Don't write anything if the status code doesn't allow a body
 	if len(b) == 0 {
 		return 0, nil
 	}
-	
+
 	w.wroteBody = true
-	
+
 	var n int
 	var err error
-	
+
 	if w.doCompress && w.gzWriter != nil {
 		n, err = w.gzWriter.Write(b)
 		if err == nil {
@@ -149,7 +149,7 @@ func (w *compressResponseWriter) Write(b []byte) (int, error) {
 			}
 		}
 	}
-	
+
 	return n, err
 }
 
@@ -257,7 +257,7 @@ func main() {
 		ErrorLog:  log.New(os.Stderr, "HTTPS Server Error: ", log.Ldate|log.Ltime|log.Lshortfile),
 		ConnState: logConnState,
 		// Timeouts for better connection management
-		ReadTimeout:       30 * time.Second,
+		ReadTimeout:       600 * time.Second,
 		ReadHeaderTimeout: 10 * time.Second,
 		WriteTimeout:      30 * time.Second,
 		IdleTimeout:       120 * time.Second,
@@ -694,15 +694,15 @@ func compressionMiddleware(next http.Handler) http.Handler {
 		// Early detection of special protocols
 		isWebSocket := websocket.IsWebSocketUpgrade(r)
 		isSSE := r.Header.Get("Accept") == "text/event-stream"
-		isStreaming := strings.Contains(r.URL.Path, "/stream") || 
+		isStreaming := strings.Contains(r.URL.Path, "/stream") ||
 			strings.Contains(r.Header.Get("Accept"), "text/event-stream")
-		
+
 		// Skip compression for special cases
 		if *disableCompression || isWebSocket || isSSE || isStreaming {
 			next.ServeHTTP(w, r)
 			return
 		}
-		
+
 		// Check if client accepts gzip
 		if !strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
 			next.ServeHTTP(w, r)
@@ -712,7 +712,7 @@ func compressionMiddleware(next http.Handler) http.Handler {
 		// Don't set Vary header here - let the compressResponseWriter decide
 		// Check if this is a HEAD request
 		isHEAD := r.Method == http.MethodHead
-		
+
 		var crw *compressResponseWriter
 		if !isHEAD {
 			gz := gzip.NewWriter(w)
@@ -735,7 +735,7 @@ func compressionMiddleware(next http.Handler) http.Handler {
 
 		// Serve the request
 		next.ServeHTTP(crw, r)
-		
+
 		// After handler completes, ensure all data is flushed before response ends
 		// This is critical for small responses that might be buffered
 		if crw.doCompress && crw.gzWriter != nil && crw.wroteBody {
@@ -751,7 +751,7 @@ func compressionMiddleware(next http.Handler) http.Handler {
 				}
 			}
 		}
-		
+
 		// Ensure the response is fully sent to the client
 		if flusher, ok := w.(http.Flusher); ok {
 			flusher.Flush()
