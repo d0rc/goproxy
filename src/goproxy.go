@@ -17,6 +17,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"compress/gzip"
@@ -29,7 +30,11 @@ import (
 
 var (
 	disableCompression = flag.Bool("disable-compression", false, "Disable gzip compression entirely")
+	requestCounter     uint64 // Atomic counter for request IDs
 )
+
+// RequestIDKey is the context key for request IDs
+type RequestIDKey struct{}
 
 //go:embed mime.types
 var mimeTypesData string
@@ -60,6 +65,7 @@ type compressResponseWriter struct {
 	isStreaming bool
 	wroteBody   bool // Track if we actually wrote any body data
 	statusCode  int  // Track the status code
+	requestID   uint64
 }
 
 func (w *compressResponseWriter) WriteHeader(status int) {
@@ -76,6 +82,10 @@ func (w *compressResponseWriter) WriteHeader(status int) {
 	w.isStreaming = strings.Contains(contentType, "text/event-stream") ||
 		strings.Contains(contentType, "application/octet-stream") ||
 		w.Header().Get("X-Content-Type-Options") == "nosniff"
+
+	if w.isStreaming {
+		log.Printf("[REQ-%d] Detected streaming response (Content-Type: %s)", w.requestID, contentType)
+	}
 
 	// Check if this status code allows a body
 	statusAllowsBody := status != http.StatusNoContent &&
@@ -150,6 +160,10 @@ func (w *compressResponseWriter) Write(b []byte) (int, error) {
 		}
 	}
 
+	if err != nil && w.isStreaming {
+		log.Printf("[REQ-%d] Write error for streaming response: %v", w.requestID, err)
+	}
+
 	return n, err
 }
 
@@ -195,6 +209,8 @@ func main() {
 	// Create the main router
 	mainRouter := mux.NewRouter()
 
+	// Add request ID middleware first
+	mainRouter.Use(requestIDMiddleware)
 	// Add compression middleware BEFORE logging middleware
 	mainRouter.Use(compressionMiddleware)
 	mainRouter.Use(loggingMiddleware)
@@ -246,7 +262,7 @@ func main() {
 	// Set up the TLS configuration
 	tlsConfig := &tls.Config{
 		GetCertificate: loggedGetCertificate,
-		NextProtos:     []string{"h2", "http/1.1", acme.ALPNProto},
+		NextProtos:     []string{"http/1.1", acme.ALPNProto},
 	}
 
 	// Set up the HTTPS server with proper timeouts
@@ -259,8 +275,8 @@ func main() {
 		// Timeouts for better connection management
 		ReadTimeout:       600 * time.Second,
 		ReadHeaderTimeout: 10 * time.Second,
-		WriteTimeout:      30 * time.Second,
-		IdleTimeout:       120 * time.Second,
+		WriteTimeout:      600 * time.Second,
+		IdleTimeout:       600 * time.Second,
 		MaxHeaderBytes:    1 << 20, // 1 MB
 	}
 
@@ -420,7 +436,7 @@ func singleJoiningSlash(a, b string) string {
 }
 
 func createReverseProxy(targetURL string) http.Handler {
-	log.Printf("creating reverse proxy for url: %s", targetURL)
+	log.Printf("Creating reverse proxy for url: %s", targetURL)
 	target, err := url.Parse(targetURL)
 	if err != nil {
 		log.Fatalf("Error parsing proxy URL: %v", err)
@@ -430,15 +446,15 @@ func createReverseProxy(targetURL string) http.Handler {
 	transport := &http.Transport{
 		Proxy: http.ProxyFromEnvironment,
 		DialContext: (&net.Dialer{
-			Timeout:   30 * time.Second,
-			KeepAlive: 30 * time.Second,
+			Timeout:   600 * time.Second,
+			KeepAlive: 600 * time.Second,
 		}).DialContext,
 		ForceAttemptHTTP2:     true,
 		MaxIdleConns:          100,
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
-		ResponseHeaderTimeout: 30 * time.Second,
+		ResponseHeaderTimeout: 600 * time.Second,
 	}
 
 	proxy := &httputil.ReverseProxy{
@@ -466,6 +482,12 @@ func createReverseProxy(targetURL string) http.Handler {
 	proxy.Director = func(req *http.Request) {
 		originalDirector(req)
 
+		// Get request ID from context
+		requestID := uint64(0)
+		if id, ok := req.Context().Value(RequestIDKey{}).(uint64); ok {
+			requestID = id
+		}
+
 		// Get the client IP
 		clientIP := req.RemoteAddr
 		if colon := strings.LastIndex(clientIP, ":"); colon != -1 {
@@ -475,6 +497,7 @@ func createReverseProxy(targetURL string) http.Handler {
 		// Set headers to be forwarded
 		req.Header.Set("X-Real-IP", clientIP)
 		req.Header.Set("X-Forwarded-Proto", "https")
+		req.Header.Set("X-Request-ID", fmt.Sprintf("%d", requestID))
 
 		// Get existing X-Forwarded-For header
 		forwardedFor := req.Header.Get("X-Forwarded-For")
@@ -485,26 +508,41 @@ func createReverseProxy(targetURL string) http.Handler {
 			// Set new X-Forwarded-For header with client IP
 			req.Header.Set("X-Forwarded-For", clientIP)
 		}
+
+		log.Printf("[REQ-%d] Proxying request to %s%s", requestID, target.Host, req.URL.Path)
 	}
 
 	// Custom ModifyResponse to handle streaming
 	proxy.ModifyResponse = func(resp *http.Response) error {
+		// Get request ID from the request header we set
+		requestID := uint64(0)
+		if idStr := resp.Request.Header.Get("X-Request-ID"); idStr != "" {
+			fmt.Sscanf(idStr, "%d", &requestID)
+		}
+
 		// Check if this is a streaming response
 		contentType := resp.Header.Get("Content-Type")
 		if strings.Contains(contentType, "text/event-stream") ||
 			strings.Contains(contentType, "application/octet-stream") {
+			log.Printf("[REQ-%d] Proxy received streaming response (Content-Type: %s, Status: %d)",
+				requestID, contentType, resp.StatusCode)
 			// Ensure proper headers for streaming
 			resp.Header.Set("Cache-Control", "no-cache")
 			resp.Header.Set("Connection", "keep-alive")
 			resp.Header.Del("Content-Length")
 			resp.Header.Set("Transfer-Encoding", "chunked")
+			resp.Header.Set("X-Accel-Buffering", "no") // Disable nginx buffering if present
 		}
 		return nil
 	}
 
 	// Add error handling
 	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
-		log.Printf("Proxy error for %s: %v", r.URL.Path, err)
+		requestID := uint64(0)
+		if id, ok := r.Context().Value(RequestIDKey{}).(uint64); ok {
+			requestID = id
+		}
+		log.Printf("[REQ-%d] Proxy error for %s: %v", requestID, r.URL.Path, err)
 		w.WriteHeader(http.StatusBadGateway)
 		fmt.Fprintf(w, "Proxy error: %v", err)
 	}
@@ -578,18 +616,113 @@ func manageCertificates() {
 	wg.Wait()
 }
 
+// requestIDMiddleware adds a unique request ID to each request
+func requestIDMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Generate unique request ID
+		requestID := atomic.AddUint64(&requestCounter, 1)
+
+		// Add to context
+		ctx := context.WithValue(r.Context(), RequestIDKey{}, requestID)
+		r = r.WithContext(ctx)
+
+		// Add to response header for debugging
+		w.Header().Set("X-Request-ID", fmt.Sprintf("%d", requestID))
+
+		// Log request start with all headers for SSE debugging
+		if strings.Contains(r.Header.Get("Accept"), "text/event-stream") ||
+			strings.Contains(r.URL.Path, "/stream") ||
+			strings.Contains(r.URL.Path, "/events") ||
+			strings.Contains(r.URL.Path, "/sse") {
+			log.Printf("[REQ-%d] SSE Request detected - Method: %s, Path: %s, Accept: %s, User-Agent: %s",
+				requestID, r.Method, r.URL.Path, r.Header.Get("Accept"), r.Header.Get("User-Agent"))
+		}
+
+		next.ServeHTTP(w, r)
+	})
+}
+
+// trackedResponseWriter wraps ResponseWriter to track response details
+type trackedResponseWriter struct {
+	http.ResponseWriter
+	requestID  uint64
+	statusCode int
+	written    int64
+	startTime  time.Time
+}
+
+func (w *trackedResponseWriter) WriteHeader(status int) {
+	w.statusCode = status
+	log.Printf("[REQ-%d] Writing response header - Status: %d, Time elapsed: %v",
+		w.requestID, status, time.Since(w.startTime))
+	w.ResponseWriter.WriteHeader(status)
+}
+
+func (w *trackedResponseWriter) Write(b []byte) (int, error) {
+	if w.statusCode == 0 {
+		w.statusCode = http.StatusOK
+	}
+	n, err := w.ResponseWriter.Write(b)
+	w.written += int64(n)
+
+	// Log write errors
+	if err != nil {
+		log.Printf("[REQ-%d] Write error after %d bytes, elapsed: %v - Error: %v",
+			w.requestID, w.written, time.Since(w.startTime), err)
+	}
+
+	return n, err
+}
+
 func loggingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
-		log.Printf("Received request: %s %s from %s", r.Method, r.URL.Path, r.RemoteAddr)
-		next.ServeHTTP(w, r)
-		log.Printf(
-			"Completed request: %s %s from %s in %s",
-			r.Method,
-			r.URL.Path,
-			r.RemoteAddr,
-			time.Since(start),
-		)
+
+		// Get request ID from context
+		requestID := uint64(0)
+		if id, ok := r.Context().Value(RequestIDKey{}).(uint64); ok {
+			requestID = id
+		}
+
+		// Log request details
+		log.Printf("[REQ-%d] START - %s %s from %s, Host: %s, Content-Type: %s",
+			requestID, r.Method, r.URL.Path, r.RemoteAddr, r.Host, r.Header.Get("Content-Type"))
+
+		// Wrap response writer to track details
+		tracked := &trackedResponseWriter{
+			ResponseWriter: w,
+			requestID:      requestID,
+			startTime:      start,
+		}
+
+		// Set up a timer to log if request is still running after 30 seconds
+		timer := time.AfterFunc(30*time.Second, func() {
+			log.Printf("[REQ-%d] WARNING: Request still running after 30 seconds - %s %s",
+				requestID, r.Method, r.URL.Path)
+		})
+
+		// Set up another timer for 36 seconds
+		timer36 := time.AfterFunc(36*time.Second, func() {
+			log.Printf("[REQ-%d] WARNING: Request still running after 36 seconds - %s %s",
+				requestID, r.Method, r.URL.Path)
+		})
+
+		next.ServeHTTP(tracked, r)
+
+		// Cancel timers
+		timer.Stop()
+		timer36.Stop()
+
+		duration := time.Since(start)
+		log.Printf("[REQ-%d] END - %s %s - Status: %d, Bytes: %d, Duration: %v",
+			requestID, r.Method, r.URL.Path, tracked.statusCode, tracked.written, duration)
+
+		// Log warning for requests that took close to timeout values
+		if duration > 29*time.Second && duration < 31*time.Second {
+			log.Printf("[REQ-%d] WARNING: Request duration near 30s timeout: %v", requestID, duration)
+		} else if duration > 35*time.Second && duration < 37*time.Second {
+			log.Printf("[REQ-%d] WARNING: Request duration near 36s mark: %v", requestID, duration)
+		}
 	})
 }
 
@@ -624,7 +757,13 @@ func loggedGetCertificate(hello *tls.ClientHelloInfo) (*tls.Certificate, error) 
 }
 
 func logConnState(conn net.Conn, state http.ConnState) {
-	log.Printf("Connection state changed: %s -> %s", conn.RemoteAddr(), state)
+	timestamp := time.Now().Format("15:04:05.000")
+	log.Printf("[CONN] %s - %s -> %s", timestamp, conn.RemoteAddr(), state)
+
+	// Log additional details for connection close events
+	if state == http.StateClosed || state == http.StateHijacked {
+		log.Printf("[CONN] %s - Connection closed/hijacked: %s", timestamp, conn.RemoteAddr())
+	}
 }
 
 func basicAuthMiddleware(next http.Handler, config DomainConfig) http.Handler {
@@ -691,14 +830,26 @@ func shouldCompress(contentType string) bool {
 
 func compressionMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Get request ID from context
+		requestID := uint64(0)
+		if id, ok := r.Context().Value(RequestIDKey{}).(uint64); ok {
+			requestID = id
+		}
+
 		// Early detection of special protocols
 		isWebSocket := websocket.IsWebSocketUpgrade(r)
-		isSSE := r.Header.Get("Accept") == "text/event-stream"
-		isStreaming := strings.Contains(r.URL.Path, "/stream") ||
+		isSSE := r.Header.Get("Accept") == "text/event-stream" ||
 			strings.Contains(r.Header.Get("Accept"), "text/event-stream")
+		isStreaming := strings.Contains(r.URL.Path, "/stream") ||
+			strings.Contains(r.URL.Path, "/events") ||
+			strings.Contains(r.URL.Path, "/sse") ||
+			isSSE
 
 		// Skip compression for special cases
 		if *disableCompression || isWebSocket || isSSE || isStreaming {
+			if isSSE || isStreaming {
+				log.Printf("[REQ-%d] Skipping compression for SSE/streaming request", requestID)
+			}
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -721,6 +872,7 @@ func compressionMiddleware(next http.Handler) http.Handler {
 				gzWriter:       gz,
 				wroteBody:      false,
 				statusCode:     http.StatusOK,
+				requestID:      requestID,
 			}
 		} else {
 			// For HEAD requests, don't create a gzip writer at all
@@ -730,6 +882,7 @@ func compressionMiddleware(next http.Handler) http.Handler {
 				doCompress:     false,
 				wroteBody:      false,
 				statusCode:     http.StatusOK,
+				requestID:      requestID,
 			}
 		}
 
