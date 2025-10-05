@@ -16,7 +16,7 @@ A lightweight, feature-rich HTTPS reverse proxy server written in Go, with autom
 - 🗜️ Intelligent content compression (gzip)
 - 🔑 Basic authentication support per domain
 - 🔄 Domain-level redirects
-- 🎯 Custom fallback paths for SPAs
+- 🎯 Custom fallback paths for SPAs (works with both static serving and proxy)
 
 ## Quick Start
 
@@ -54,7 +54,7 @@ The configuration file uses a simple key-value format:
     - `path`: URL path to match
     - `target_url`: Destination URL to proxy (supports both HTTP and WebSocket)
 - `auth`: Format is `auth=<username> <password>` for Basic Authentication
-- `fallback_path`: Path to serve when a static file is not found (e.g., for SPA routing)
+- `fallback_path`: Path to serve when a file is not found (e.g., `/index.html` for SPA routing). Works with both static file serving and proxy configurations
 - `redirect`: Redirects all requests to the specified domain while preserving paths and query parameters
 
 The proxy automatically handles content compression (gzip) for appropriate content types including:
@@ -66,11 +66,17 @@ The proxy automatically handles content compression (gzip) for appropriate conte
 ### Example Configuration
 
 ```txt
-# Main website
+# Main website with static files and API proxy
 domain=example.com
 static_dir=/var/www/main
 proxy=/api https://api.internal:8080
 proxy=/ws ws://websocket.internal:8081
+fallback_path=/index.html
+
+# SPA with full proxy (NEW: fallback_path now works with proxy)
+domain=spa.example.com
+static_dir=/var/www/spa-static
+proxy=/ http://backend:3000
 fallback_path=/index.html
 
 # Redirect www subdomain to naked domain
@@ -109,12 +115,45 @@ redirect=example.com   # Optional redirect target
 - Error handling and logging
 - Request/response header modification
 - Connection state monitoring
+- **SPA fallback support**: When proxying returns 404, can serve a fallback file (e.g., `index.html`) for client-side routing
 
-### Static File Serving
+### SPA (Single Page Application) Support
+
+GoProxy provides comprehensive SPA support through the `fallback_path` configuration:
+
+#### How It Works
+
+1. **With Static Files Only**: When a requested file doesn't exist, serves the fallback file
+2. **With Proxy**: When the proxied backend returns 404, intelligently determines if it should serve the fallback:
+   - Navigation requests (Accept: text/html) → Serve fallback
+   - API requests (Accept: application/json, paths with /api/) → Return 404
+   - Static assets (.js, .css, images, etc.) → Return 404
+
+#### Configuration for SPAs
+
+```txt
+# Pure static SPA
+domain=myapp.com
+static_dir=/var/www/app
+fallback_path=/index.html
+
+# SPA with backend proxy
+domain=myapp.com
+static_dir=/var/www/app
+proxy=/ http://backend:3000
+fallback_path=/index.html
+```
+
+This allows SPAs to handle client-side routing while still properly returning 404s for missing API endpoints and static assets.
+
+### Static File Serving & SPA Support
 
 - Serve static files for each domain
 - Automatic index file serving
 - Clean URLs without file extensions
+- SPA fallback support for client-side routing
+- Intelligent detection of navigation vs. asset requests
+- Works with both static serving and proxy configurations
 
 ### Logging
 

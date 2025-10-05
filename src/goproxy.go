@@ -3,11 +3,13 @@ package main
 // -build-me-for: linux
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/tls"
 	_ "embed"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"mime"
 	"net"
@@ -51,8 +53,10 @@ type DomainConfig struct {
 }
 
 var (
-	domains     map[string]DomainConfig
-	certManager *autocert.Manager
+	domains        map[string]DomainConfig
+	certManager    *autocert.Manager
+	fallbackCache  = make(map[string][]byte) // Cache for fallback content
+	fallbackMutex  sync.RWMutex              // Mutex for fallback cache
 )
 
 // compressResponseWriter is a response writer that decides whether to compress
@@ -79,9 +83,8 @@ func (w *compressResponseWriter) WriteHeader(status int) {
 	contentEncoding := w.Header().Get("Content-Encoding")
 
 	// Check if this is a streaming response
-	w.isStreaming = strings.Contains(contentType, "text/event-stream") ||
-		strings.Contains(contentType, "application/octet-stream") ||
-		w.Header().Get("X-Content-Type-Options") == "nosniff"
+	// Only mark as streaming for actual streaming content types
+	w.isStreaming = strings.Contains(contentType, "text/event-stream")
 
 	if w.isStreaming {
 		log.Printf("[REQ-%d] Detected streaming response (Content-Type: %s)", w.requestID, contentType)
@@ -240,8 +243,23 @@ func main() {
 		// Set up proxy routes FIRST
 		for path, targetURL := range config.ProxyURLs {
 			log.Printf("Setting up proxy route for domain %s: %s -> %s", domain, path, targetURL)
-			proxy := createReverseProxy(targetURL)
-			router.PathPrefix(path).Handler(proxy)
+			// Check if this is a catch-all proxy and we have a fallback configured
+			if path == "/" && config.FallbackPath != "" {
+				// Create a special handler that combines proxy with fallback
+				// Works with or without static_dir
+				if config.StaticDir != "" {
+					// Use static file fallback
+					proxy := createProxyWithStaticFallback(targetURL, config.StaticDir, config.FallbackPath)
+					router.PathPrefix(path).Handler(proxy)
+				} else {
+					// Use proxy-based fallback (fetch from backend)
+					proxy := createProxyWithProxyFallback(targetURL, config.FallbackPath)
+					router.PathPrefix(path).Handler(proxy)
+				}
+			} else {
+				proxy := createReverseProxy(targetURL)
+				router.PathPrefix(path).Handler(proxy)
+			}
 		}
 
 		// Set up static file serving LAST
@@ -436,7 +454,14 @@ func singleJoiningSlash(a, b string) string {
 }
 
 func createReverseProxy(targetURL string) http.Handler {
+	return createReverseProxyWithFallback(targetURL, "")
+}
+
+func createReverseProxyWithFallback(targetURL string, fallbackPath string) http.Handler {
 	log.Printf("Creating reverse proxy for url: %s", targetURL)
+	if fallbackPath != "" {
+		log.Printf("  with SPA fallback to: %s", fallbackPath)
+	}
 	target, err := url.Parse(targetURL)
 	if err != nil {
 		log.Fatalf("Error parsing proxy URL: %v", err)
@@ -512,7 +537,7 @@ func createReverseProxy(targetURL string) http.Handler {
 		log.Printf("[REQ-%d] Proxying request to %s%s", requestID, target.Host, req.URL.Path)
 	}
 
-	// Custom ModifyResponse to handle streaming
+	// Custom ModifyResponse to handle streaming and SPA fallback
 	proxy.ModifyResponse = func(resp *http.Response) error {
 		// Get request ID from the request header we set
 		requestID := uint64(0)
@@ -533,6 +558,19 @@ func createReverseProxy(targetURL string) http.Handler {
 			resp.Header.Set("Transfer-Encoding", "chunked")
 			resp.Header.Set("X-Accel-Buffering", "no") // Disable nginx buffering if present
 		}
+
+		// Handle SPA fallback for 404 responses
+		if fallbackPath != "" && resp.StatusCode == http.StatusNotFound {
+			// Check if this is likely a navigation request (not an API or asset request)
+			if shouldFallbackToSPA(resp.Request) {
+				log.Printf("[REQ-%d] Proxy 404 detected, checking for SPA fallback", requestID)
+				
+				// We can't directly serve a file here, but we can modify the response
+				// to indicate that fallback should be served
+				resp.Header.Set("X-Proxy-Fallback", fallbackPath)
+			}
+		}
+
 		return nil
 	}
 
@@ -579,6 +617,314 @@ func customFileServer(root http.FileSystem, fallback string) http.Handler {
 		}
 		fs.ServeHTTP(w, r)
 	})
+}
+
+// shouldFallbackToSPA determines if a 404 response should trigger SPA fallback
+func shouldFallbackToSPA(req *http.Request) bool {
+	// Get request ID for logging
+	requestID := uint64(0)
+	if id, ok := req.Context().Value(RequestIDKey{}).(uint64); ok {
+		requestID = id
+	}
+	
+	// Get the Accept header
+	accept := req.Header.Get("Accept")
+	log.Printf("[REQ-%d] shouldFallbackToSPA: Path=%s, Accept=%s", requestID, req.URL.Path, accept)
+	
+	// Check if this is likely an API request
+	if strings.Contains(accept, "application/json") {
+		log.Printf("[REQ-%d] shouldFallbackToSPA: NO - Accept contains application/json", requestID)
+		return false
+	}
+	if strings.Contains(req.URL.Path, "/api/") || strings.Contains(req.URL.Path, "/ws/") || strings.Contains(req.URL.Path, "/websocket") {
+		log.Printf("[REQ-%d] shouldFallbackToSPA: NO - Path contains API/WS indicators", requestID)
+		return false
+	}
+	
+	// Check if this is a static asset request
+	ext := strings.ToLower(getFileExtension(req.URL.Path))
+	if ext != "" {
+		log.Printf("[REQ-%d] shouldFallbackToSPA: File extension detected: %s", requestID, ext)
+	}
+	
+	staticExtensions := map[string]bool{
+		".js":    true,
+		".css":   true,
+		".png":   true,
+		".jpg":   true,
+		".jpeg":  true,
+		".gif":   true,
+		".svg":   true,
+		".ico":   true,
+		".woff":  true,
+		".woff2": true,
+		".ttf":   true,
+		".eot":   true,
+		".map":   true,
+		".json":  true,
+		".xml":   true,
+		".txt":   true,
+		".webp":  true,
+		".avif":  true,
+	}
+	
+	if staticExtensions[ext] {
+		log.Printf("[REQ-%d] shouldFallbackToSPA: NO - Static asset extension", requestID)
+		return false
+	}
+	
+	// Check if the client accepts HTML (navigation request)
+	// This is the primary indicator of a browser navigation request
+	if strings.Contains(accept, "text/html") {
+		log.Printf("[REQ-%d] shouldFallbackToSPA: YES - Accept contains text/html", requestID)
+		return true
+	}
+	if accept == "*/*" || accept == "" {
+		log.Printf("[REQ-%d] shouldFallbackToSPA: YES - Accept is wildcard or empty", requestID)
+		return true
+	}
+	
+	log.Printf("[REQ-%d] shouldFallbackToSPA: NO - No matching criteria", requestID)
+	return false
+}
+
+// getFileExtension extracts the file extension from a path
+func getFileExtension(path string) string {
+	// Remove query string if present
+	if idx := strings.Index(path, "?"); idx != -1 {
+		path = path[:idx]
+	}
+	
+	// Find the last dot
+	if idx := strings.LastIndex(path, "."); idx != -1 {
+		return path[idx:]
+	}
+	
+	return ""
+}
+
+// createProxyWithStaticFallback creates a handler that tries proxy first, then falls back to static files for 404s
+func createProxyWithStaticFallback(targetURL string, staticDir string, fallbackPath string) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Get request ID from context
+		requestID := uint64(0)
+		if id, ok := r.Context().Value(RequestIDKey{}).(uint64); ok {
+			requestID = id
+		}
+		
+		log.Printf("[REQ-%d] ProxyWithStaticFallback: Starting for path %s", requestID, r.URL.Path)
+		log.Printf("[REQ-%d] ProxyWithStaticFallback: Accept header: %s", requestID, r.Header.Get("Accept"))
+		
+		// Create a buffering response writer to capture the response
+		brw := &bufferingResponseWriter{
+			ResponseWriter: w,
+			statusCode:     http.StatusOK,
+			requestID:      requestID,
+		}
+		
+		// Try the proxy first
+		log.Printf("[REQ-%d] ProxyWithStaticFallback: Calling proxy for %s", requestID, targetURL)
+		proxy := createReverseProxyWithFallback(targetURL, fallbackPath)
+		proxy.ServeHTTP(brw, r)
+		
+		log.Printf("[REQ-%d] ProxyWithStaticFallback: Proxy returned status %d", requestID, brw.statusCode)
+		
+		// Check if we should serve the fallback
+		if brw.statusCode == http.StatusNotFound && fallbackPath != "" {
+			shouldFallback := shouldFallbackToSPA(r)
+			log.Printf("[REQ-%d] ProxyWithStaticFallback: 404 detected, shouldFallback=%v", requestID, shouldFallback)
+			
+			if shouldFallback {
+				log.Printf("[REQ-%d] ProxyWithStaticFallback: Serving SPA fallback from %s", requestID, staticDir+fallbackPath)
+				// Don't write the buffered 404 response, serve the fallback instead
+				http.ServeFile(w, r, staticDir+fallbackPath)
+				return
+			}
+		}
+		
+		// Write the buffered response
+		log.Printf("[REQ-%d] ProxyWithStaticFallback: Writing original response with status %d", requestID, brw.statusCode)
+		w.WriteHeader(brw.statusCode)
+		if brw.body.Len() > 0 {
+			w.Write(brw.body.Bytes())
+		}
+	})
+}
+
+// createProxyWithProxyFallback creates a handler that fetches fallback from the proxy itself
+func createProxyWithProxyFallback(targetURL string, fallbackPath string) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Get request ID from context
+		requestID := uint64(0)
+		if id, ok := r.Context().Value(RequestIDKey{}).(uint64); ok {
+			requestID = id
+		}
+		
+		log.Printf("[REQ-%d] ProxyWithProxyFallback: Starting for path %s", requestID, r.URL.Path)
+		log.Printf("[REQ-%d] ProxyWithProxyFallback: Accept header: %s", requestID, r.Header.Get("Accept"))
+		
+		// Check if this is a streaming request (SSE)
+		isStreaming := r.Header.Get("Accept") == "text/event-stream" ||
+			strings.Contains(r.Header.Get("Accept"), "text/event-stream") ||
+			strings.Contains(r.URL.Path, "/events") ||
+			strings.Contains(r.URL.Path, "/stream") ||
+			strings.Contains(r.URL.Path, "/sse")
+		
+		if isStreaming {
+			// For streaming requests, bypass buffering entirely
+			log.Printf("[REQ-%d] ProxyWithProxyFallback: Detected streaming request, bypassing buffering", requestID)
+			proxy := createReverseProxy(targetURL)
+			proxy.ServeHTTP(w, r)
+			return
+		}
+		
+		// For non-streaming requests, use buffering to check for 404
+		// Create a buffering response writer to capture the response
+		brw := &bufferingResponseWriter{
+			ResponseWriter: w,
+			statusCode:     http.StatusOK,
+			requestID:      requestID,
+		}
+		
+		// Try the proxy first
+		log.Printf("[REQ-%d] ProxyWithProxyFallback: Calling proxy for %s", requestID, targetURL)
+		proxy := createReverseProxyWithFallback(targetURL, fallbackPath)
+		proxy.ServeHTTP(brw, r)
+		
+		log.Printf("[REQ-%d] ProxyWithProxyFallback: Proxy returned status %d", requestID, brw.statusCode)
+		
+		// Check if we should serve the fallback
+		if brw.statusCode == http.StatusNotFound && fallbackPath != "" {
+			shouldFallback := shouldFallbackToSPA(r)
+			log.Printf("[REQ-%d] ProxyWithProxyFallback: 404 detected, shouldFallback=%v", requestID, shouldFallback)
+			
+			if shouldFallback {
+				// Try to get fallback content from cache or proxy
+				cacheKey := targetURL + fallbackPath
+				fallbackContent := getFallbackContent(cacheKey, targetURL, fallbackPath, requestID)
+				
+				if fallbackContent != nil {
+					log.Printf("[REQ-%d] ProxyWithProxyFallback: Serving SPA fallback (size: %d bytes)", requestID, len(fallbackContent))
+					// Clear any headers from the buffered 404 response
+					// This is important for HTTP/2 compliance
+					for k := range w.Header() {
+						delete(w.Header(), k)
+					}
+					// Set fresh headers for the fallback content
+					w.Header().Set("Content-Type", "text/html; charset=utf-8")
+					w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+					w.Header().Set("Content-Length", fmt.Sprintf("%d", len(fallbackContent)))
+					w.WriteHeader(http.StatusOK)
+					w.Write(fallbackContent)
+					return
+				} else {
+					log.Printf("[REQ-%d] ProxyWithProxyFallback: Failed to get fallback content", requestID)
+				}
+			}
+		}
+		
+		// Write the buffered response
+		log.Printf("[REQ-%d] ProxyWithProxyFallback: Writing original response with status %d", requestID, brw.statusCode)
+		// Copy headers from buffered response (if any were set)
+		for k, v := range brw.Header() {
+			w.Header()[k] = v
+		}
+		// Set Content-Length for non-streaming responses
+		if brw.body.Len() > 0 {
+			w.Header().Set("Content-Length", fmt.Sprintf("%d", brw.body.Len()))
+		}
+		w.WriteHeader(brw.statusCode)
+		if brw.body.Len() > 0 {
+			w.Write(brw.body.Bytes())
+		}
+	})
+}
+
+// getFallbackContent retrieves fallback content from cache or fetches from proxy
+func getFallbackContent(cacheKey string, targetURL string, fallbackPath string, requestID uint64) []byte {
+	// Check cache first
+	fallbackMutex.RLock()
+	content, exists := fallbackCache[cacheKey]
+	fallbackMutex.RUnlock()
+	
+	if exists {
+		log.Printf("[REQ-%d] Using cached fallback content for %s", requestID, fallbackPath)
+		return content
+	}
+	
+	// Fetch from proxy
+	log.Printf("[REQ-%d] Fetching fallback content from proxy: %s%s", requestID, targetURL, fallbackPath)
+	
+	// Parse the target URL
+	target, err := url.Parse(targetURL)
+	if err != nil {
+		log.Printf("[REQ-%d] Error parsing proxy URL: %v", requestID, err)
+		return nil
+	}
+	
+	// Create the full URL for the fallback
+	fallbackURL := *target
+	fallbackURL.Path = fallbackPath
+	
+	// Create a new request for the fallback
+	client := &http.Client{
+		Timeout: 10 * time.Second,
+	}
+	
+	resp, err := client.Get(fallbackURL.String())
+	if err != nil {
+		log.Printf("[REQ-%d] Error fetching fallback from proxy: %v", requestID, err)
+		return nil
+	}
+	defer resp.Body.Close()
+	
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("[REQ-%d] Proxy returned non-200 status for fallback: %d", requestID, resp.StatusCode)
+		return nil
+	}
+	
+	// Read the response body
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		log.Printf("[REQ-%d] Error reading fallback response: %v", requestID, err)
+		return nil
+	}
+	
+	// Cache the content
+	fallbackMutex.Lock()
+	fallbackCache[cacheKey] = body
+	fallbackMutex.Unlock()
+	
+	log.Printf("[REQ-%d] Cached fallback content for %s (size: %d bytes)", requestID, fallbackPath, len(body))
+	return body
+}
+
+// bufferingResponseWriter buffers the entire response to allow for fallback decisions
+type bufferingResponseWriter struct {
+	http.ResponseWriter
+	statusCode    int
+	headerWritten bool
+	body          bytes.Buffer
+	requestID     uint64
+}
+
+func (w *bufferingResponseWriter) WriteHeader(status int) {
+	if !w.headerWritten {
+		w.statusCode = status
+		w.headerWritten = true
+		log.Printf("[REQ-%d] BufferingResponseWriter: Captured status %d", w.requestID, status)
+		// Don't write to the underlying ResponseWriter yet
+	}
+}
+
+func (w *bufferingResponseWriter) Write(b []byte) (int, error) {
+	if !w.headerWritten {
+		w.WriteHeader(http.StatusOK)
+	}
+	// Buffer the response body
+	n, err := w.body.Write(b)
+	log.Printf("[REQ-%d] BufferingResponseWriter: Buffered %d bytes (total: %d)", w.requestID, n, w.body.Len())
+	return n, err
 }
 
 func manageCertificates() {
